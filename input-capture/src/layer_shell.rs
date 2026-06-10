@@ -162,9 +162,17 @@ impl Window {
         log::debug!("creating window output: {output:?}, size: {size:?}");
         let g = &state.globals;
 
+        // Hyprland workaround (hyprwm/Hyprland#6170): on Hyprland the cursor cannot reach the
+        // leftmost/topmost column of the desktop -- it stops one pixel short (edge+1). A 1px
+        // barrier anchored at the top/left edge therefore sits on a column the pointer never
+        // enters, so capture never triggers; only "left"/"top" edge-switching is affected, since
+        // the right/bottom barriers sit on the last reachable pixel and work. Make the top/left
+        // barriers 2px so the cursor resting at edge+1 lands inside the surface and triggers it.
         let (width, height) = match pos {
-            Position::Left | Position::Right => (1, size.1 as u32),
-            Position::Top | Position::Bottom => (size.0 as u32, 1),
+            Position::Left => (2, size.1 as u32),
+            Position::Right => (1, size.1 as u32),
+            Position::Top => (size.0 as u32, 2),
+            Position::Bottom => (size.0 as u32, 1),
         };
         let mut file = tempfile::tempfile().unwrap();
         draw(&mut file, (width, height));
