@@ -170,16 +170,15 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
     log::trace!("key event: {key} {state}");
 }
 
-fn modifier_event(event_source: CGEventSource, depressed: XMods) {
-    let Ok(event) = CGEvent::new(event_source) else {
-        log::warn!("could not create CGEvent");
+fn modifier_key_event(event_source: CGEventSource, key: u16, depressed: XMods) {
+    let Ok(event) = CGEvent::new_keyboard_event(event_source, key, true) else {
+        log::warn!("could not create modifier key event");
         return;
     };
-    let flags = to_cgevent_flags(depressed);
     event.set_type(CGEventType::FlagsChanged);
-    event.set_flags(flags);
+    event.set_flags(to_cgevent_flags(depressed));
     event.post(CGEventTapLocation::HID);
-    log::trace!("modifiers updated: {depressed:?}");
+    log::trace!("modifier key event: {key} {depressed:?}");
 }
 
 fn get_display_at_point(x: CGFloat, y: CGFloat) -> Option<CGDirectDisplayID> {
@@ -388,7 +387,8 @@ impl Emulation for MacOSEmulation {
                         axis,
                         value,
                     } => {
-                        let value = value as i32;
+                        // wayland scroll sign is inverted relative to macOS
+                        let value = -value as i32;
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value, 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
@@ -415,6 +415,8 @@ impl Emulation for MacOSEmulation {
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         const LINES_PER_STEP: i32 = 3;
+                        // wayland scroll sign is inverted relative to macOS
+                        let value = -value;
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value / (120 / LINES_PER_STEP), 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value / (120 / LINES_PER_STEP), 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
@@ -461,12 +463,18 @@ impl Emulation for MacOSEmulation {
                     };
                     let is_modifier = update_modifiers(&self.modifier_state, key, state);
                     if is_modifier {
-                        modifier_event(self.event_source.clone(), self.modifier_state.get());
-                    }
-                    match state {
-                        // pressed
-                        1 => self.spawn_repeat_task(code).await,
-                        _ => self.cancel_repeat_task().await,
+                        // modifiers are posted as FlagsChanged and must not enter the repeat task
+                        modifier_key_event(
+                            self.event_source.clone(),
+                            code,
+                            self.modifier_state.get(),
+                        );
+                    } else {
+                        match state {
+                            // pressed
+                            1 => self.spawn_repeat_task(code).await,
+                            _ => self.cancel_repeat_task().await,
+                        }
                     }
                 }
                 KeyboardEvent::Modifiers {
@@ -475,8 +483,8 @@ impl Emulation for MacOSEmulation {
                     locked,
                     group,
                 } => {
+                    // only update state; FlagsChanged events are posted in the Key handler
                     set_modifiers(&self.modifier_state, depressed, latched, locked, group);
-                    modifier_event(self.event_source.clone(), self.modifier_state.get());
                 }
             },
         }
@@ -544,7 +552,8 @@ fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
     if depressed.contains(XMods::ControlMask) {
         flags |= CGEventFlags::CGEventFlagControl;
     }
-    if depressed.contains(XMods::Mod1Mask) {
+    if depressed.contains(XMods::Mod1Mask) || depressed.contains(XMods::Mod5Mask) {
+        // Mod5 is ISO_Level3_Shift (AltGr), right-Option on macOS
         flags |= CGEventFlags::CGEventFlagAlternate;
     }
     if depressed.contains(XMods::Mod4Mask) {
