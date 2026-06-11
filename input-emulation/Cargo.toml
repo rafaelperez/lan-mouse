@@ -52,6 +52,7 @@ bitflags = "2.6.0"
 core-foundation = "0.10.0"
 core-foundation-sys = "0.8.6"
 core-graphics = { version = "0.25.0", features = ["highsierra"] }
+foreign-types = "0.5.0"
 keycode = "1.0.0"
 
 [target.'cfg(windows)'.dependencies]

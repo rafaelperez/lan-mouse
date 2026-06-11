@@ -43,6 +43,8 @@ pub(crate) struct MacOSEmulation {
     button_click_state: i64,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
+    /// device-dependent (left/right) bits of the held modifiers (NX_DEVICE*KEYMASK)
+    device_mods: Rc<Cell<u64>>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
 }
@@ -63,7 +65,9 @@ impl MacOSEmulation {
     pub(crate) fn new() -> Result<Self, MacOSEmulationCreationError> {
         request_macos_emulation_permissions()?;
 
-        let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+        // HIDSystemState is the source state physical events report; apps that
+        // inspect the event source state ignore session-state synthetic events
+        let event_source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
         Ok(Self {
             event_source,
@@ -74,6 +78,7 @@ impl MacOSEmulation {
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            device_mods: Rc::new(Cell::new(0)),
         })
     }
 
@@ -87,11 +92,18 @@ impl MacOSEmulation {
         // always the last to be pressed
         self.cancel_repeat_task().await;
         // initial key event
-        key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
+        key_event(
+            self.event_source.clone(),
+            key,
+            1,
+            self.modifier_state.get(),
+            self.device_mods.get(),
+        );
         // repeat task
         let event_source = self.event_source.clone();
         let notify = self.notify_repeat_task.clone();
         let modifiers = self.modifier_state.clone();
+        let device_mods = self.device_mods.clone();
         let repeat_task = tokio::task::spawn_local(async move {
             let stop = tokio::select! {
                 _ = tokio::time::sleep(DEFAULT_REPEAT_DELAY) => false,
@@ -99,7 +111,7 @@ impl MacOSEmulation {
             };
             if !stop {
                 loop {
-                    key_event(event_source.clone(), key, 1, modifiers.get());
+                    key_event(event_source.clone(), key, 1, modifiers.get(), device_mods.get());
                     tokio::select! {
                         _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => {},
                         _ = notify.notified() => break,
@@ -107,8 +119,8 @@ impl MacOSEmulation {
                 }
             }
             // release key when cancelled
-            update_modifiers(&modifiers, key as u32, 0);
-            key_event(event_source.clone(), key, 0, modifiers.get());
+            update_modifiers(&modifiers, &device_mods, key as u32, 0);
+            key_event(event_source.clone(), key, 0, modifiers.get(), device_mods.get());
         });
         self.repeat_task = Some(repeat_task);
     }
@@ -150,6 +162,18 @@ fn request_input_control_permission() -> bool {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
+    fn CGEventSetTimestamp(event: *mut core_graphics::sys::CGEvent, timestamp: u64);
+}
+
+extern "C" {
+    fn mach_absolute_time() -> u64;
+}
+
+/// synthetic events otherwise carry timestamp 0; apps that measure inter-event
+/// timing (modifier-hold panels, double-press detection) can ignore them
+fn stamp_event(event: &CGEvent) {
+    use foreign_types::ForeignType;
+    unsafe { CGEventSetTimestamp(event.as_ptr(), mach_absolute_time()) };
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -157,7 +181,7 @@ extern "C" {
     fn AXIsProcessTrusted() -> bool;
 }
 
-fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
+fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods, device: u64) {
     let event = match CGEvent::new_keyboard_event(event_source, key, state != 0) {
         Ok(e) => e,
         Err(_) => {
@@ -165,18 +189,24 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
             return;
         }
     };
-    event.set_flags(to_cgevent_flags(modifiers));
+    // build the flags explicitly: CGEvent pre-seeds new events with the
+    // source's accumulated state (do not merge with get_flags), and physical
+    // function-layer keys (arrows, F-keys, Home/End/...) always carry
+    // SecondaryFn/NumericPad, which strict shortcut matchers require
+    event.set_flags(special_key_flags(key) | to_cgevent_flags(modifiers, device));
+    stamp_event(&event);
     event.post(CGEventTapLocation::HID);
     log::trace!("key event: {key} {state}");
 }
 
-fn modifier_key_event(event_source: CGEventSource, key: u16, depressed: XMods) {
+fn modifier_key_event(event_source: CGEventSource, key: u16, depressed: XMods, device: u64) {
     let Ok(event) = CGEvent::new_keyboard_event(event_source, key, true) else {
         log::warn!("could not create modifier key event");
         return;
     };
     event.set_type(CGEventType::FlagsChanged);
-    event.set_flags(to_cgevent_flags(depressed));
+    event.set_flags(to_cgevent_flags(depressed, device));
+    stamp_event(&event);
     event.post(CGEventTapLocation::HID);
     log::trace!("modifier key event: {key} {depressed:?}");
 }
@@ -457,17 +487,19 @@ impl Emulation for MacOSEmulation {
                     let code = match KeyMap::from_key_mapping(KeyMapping::Evdev(key as u16)) {
                         Ok(k) => k.mac as CGKeyCode,
                         Err(_) => {
-                            log::warn!("unable to map key event");
+                            log::warn!("unable to map key event (evdev key {key})");
                             return Ok(());
                         }
                     };
-                    let is_modifier = update_modifiers(&self.modifier_state, key, state);
+                    let is_modifier =
+                        update_modifiers(&self.modifier_state, &self.device_mods, key, state);
                     if is_modifier {
                         // modifiers are posted as FlagsChanged and must not enter the repeat task
                         modifier_key_event(
                             self.event_source.clone(),
                             code,
                             self.modifier_state.get(),
+                            self.device_mods.get(),
                         );
                     } else {
                         match state {
@@ -483,8 +515,34 @@ impl Emulation for MacOSEmulation {
                     locked,
                     group,
                 } => {
-                    // only update state; FlagsChanged events are posted in the Key handler
+                    // the Key handler posts FlagsChanged for modifier keys it sees, but
+                    // modifier state can also change without a Key event (modifier held
+                    // while entering / released after leaving) — post FlagsChanged for
+                    // the difference so apps tracking modifiers via FlagsChanged stay in
+                    // sync. Modifiers events that mirror a previous Key event are a no-op
+                    // here (state unchanged), so this cannot double modifiers.
+                    let old = self.modifier_state.get();
                     set_modifiers(&self.modifier_state, depressed, latched, locked, group);
+                    let new = self.modifier_state.get();
+                    // Modifiers events carry no left/right information: clear the
+                    // device bits of released modifiers and leave held ones alone
+                    // (to_cgevent_flags falls back to the left-side bit for a
+                    // modifier whose side was never seen)
+                    let mut dev = self.device_mods.get();
+                    for (mask, code) in [
+                        (XMods::ShiftMask, 56u16),  // kVK_Shift
+                        (XMods::ControlMask, 59),   // kVK_Control
+                        (XMods::Mod1Mask, 58),      // kVK_Option
+                        (XMods::Mod4Mask, 55),      // kVK_Command
+                    ] {
+                        if !new.contains(mask) {
+                            dev &= !device_side_bits(mask);
+                            self.device_mods.set(dev);
+                        }
+                        if (old ^ new).contains(mask) {
+                            modifier_key_event(self.event_source.clone(), code, new, dev);
+                        }
+                    }
                 }
             },
         }
@@ -499,26 +557,45 @@ impl Emulation for MacOSEmulation {
     async fn terminate(&mut self) {}
 }
 
-fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
+fn update_modifiers(
+    modifiers: &Cell<XMods>,
+    device_mods: &Cell<u64>,
+    key: u32,
+    state: u8,
+) -> bool {
     if let Ok(key) = scancode::Linux::try_from(key) {
-        let mask = match key {
-            scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
-            scancode::Linux::KeyCapsLock => XMods::LockMask,
-            scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
-            scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
-            scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
-            _ => XMods::empty(),
+        let (mask, device_bit) = match key {
+            scancode::Linux::KeyLeftShift => (XMods::ShiftMask, NX_DEVICELSHIFTKEYMASK),
+            scancode::Linux::KeyRightShift => (XMods::ShiftMask, NX_DEVICERSHIFTKEYMASK),
+            scancode::Linux::KeyCapsLock => (XMods::LockMask, 0),
+            scancode::Linux::KeyLeftCtrl => (XMods::ControlMask, NX_DEVICELCTLKEYMASK),
+            scancode::Linux::KeyRightCtrl => (XMods::ControlMask, NX_DEVICERCTLKEYMASK),
+            scancode::Linux::KeyLeftAlt => (XMods::Mod1Mask, NX_DEVICELALTKEYMASK),
+            scancode::Linux::KeyRightalt => (XMods::Mod1Mask, NX_DEVICERALTKEYMASK),
+            scancode::Linux::KeyLeftMeta => (XMods::Mod4Mask, NX_DEVICELCMDKEYMASK),
+            scancode::Linux::KeyRightmeta => (XMods::Mod4Mask, NX_DEVICERCMDKEYMASK),
+            _ => return false,
         };
-        // unchanged
-        if mask.is_empty() {
-            return false;
-        }
         let mut mods = modifiers.get();
+        let mut dev = device_mods.get();
         match state {
-            1 => mods.insert(mask),
-            _ => mods.remove(mask),
+            // caps lock latches: flip on press, ignore release
+            1 if mask == XMods::LockMask => mods.toggle(mask),
+            1 => {
+                mods.insert(mask);
+                dev |= device_bit;
+            }
+            _ if mask == XMods::LockMask => {}
+            _ => {
+                dev &= !device_bit;
+                // keep the modifier active while the other side is still held
+                if dev & device_side_bits(mask) == 0 {
+                    mods.remove(mask);
+                }
+            }
         }
         modifiers.set(mods);
+        device_mods.set(dev);
         true
     } else {
         false
@@ -534,30 +611,83 @@ fn set_modifiers(
 ) {
     let depressed = XMods::from_bits(depressed).unwrap_or_default();
     let _latched = XMods::from_bits(latched).unwrap_or_default();
-    let _locked = XMods::from_bits(locked).unwrap_or_default();
+    let locked = XMods::from_bits(locked).unwrap_or_default();
     let _group = XMods::from_bits(group).unwrap_or_default();
 
-    // we only care about the depressed modifiers for now
-    active_modifiers.replace(depressed);
+    // held modifiers come from `depressed`; caps lock latches via `locked`
+    active_modifiers.replace(depressed | (locked & XMods::LockMask));
 }
 
-fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
+fn special_key_flags(key: u16) -> CGEventFlags {
+    match key {
+        // arrow keys
+        123..=126 => CGEventFlags::CGEventFlagSecondaryFn | CGEventFlags::CGEventFlagNumericPad,
+        // Help/Insert, Home, PageUp, ForwardDelete, End, PageDown
+        114 | 115 | 116 | 117 | 119 | 121 => CGEventFlags::CGEventFlagSecondaryFn,
+        // F1-F20
+        64 | 79 | 80 | 90 | 96..=101 | 103 | 105..=107 | 109 | 111 | 113 | 118 | 120 | 122 => {
+            CGEventFlags::CGEventFlagSecondaryFn
+        }
+        _ => CGEventFlags::empty(),
+    }
+}
+
+// device-dependent modifier bits (IOKit NX_DEVICE*KEYMASK), not exposed by
+// core-graphics. Physical key events always carry them, and some apps (e.g.
+// wezterm, rcmd) use them to distinguish left from right modifiers — an event
+// with only the device-independent bit is not recognized as a held modifier
+// there. The held side is tracked per key in MacOSEmulation::device_mods.
+const NX_DEVICELCTLKEYMASK: u64 = 0x00000001;
+const NX_DEVICELSHIFTKEYMASK: u64 = 0x00000002;
+const NX_DEVICERSHIFTKEYMASK: u64 = 0x00000004;
+const NX_DEVICELCMDKEYMASK: u64 = 0x00000008;
+const NX_DEVICERCMDKEYMASK: u64 = 0x00000010;
+const NX_DEVICELALTKEYMASK: u64 = 0x00000020;
+const NX_DEVICERALTKEYMASK: u64 = 0x00000040;
+const NX_DEVICERCTLKEYMASK: u64 = 0x00002000;
+
+/// both side bits (NX_DEVICE*KEYMASK) of a modifier
+fn device_side_bits(mask: XMods) -> u64 {
+    match mask {
+        XMods::ShiftMask => NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK,
+        XMods::ControlMask => NX_DEVICELCTLKEYMASK | NX_DEVICERCTLKEYMASK,
+        XMods::Mod1Mask | XMods::Mod5Mask => NX_DEVICELALTKEYMASK | NX_DEVICERALTKEYMASK,
+        XMods::Mod4Mask => NX_DEVICELCMDKEYMASK | NX_DEVICERCMDKEYMASK,
+        _ => 0,
+    }
+}
+
+fn to_cgevent_flags(depressed: XMods, device: u64) -> CGEventFlags {
     let mut flags = CGEventFlags::empty();
+    // tracked side bits of a modifier, falling back to the left side when the
+    // side was never seen (modifier arrived via a sideless Modifiers event)
+    let side = |mask: XMods, left: u64| {
+        let bits = device & device_side_bits(mask);
+        if bits != 0 { bits } else { left }
+    };
     if depressed.contains(XMods::ShiftMask) {
-        flags |= CGEventFlags::CGEventFlagShift;
+        flags |= CGEventFlags::CGEventFlagShift
+            | CGEventFlags::from_bits_retain(side(XMods::ShiftMask, NX_DEVICELSHIFTKEYMASK));
     }
     if depressed.contains(XMods::LockMask) {
         flags |= CGEventFlags::CGEventFlagAlphaShift;
     }
     if depressed.contains(XMods::ControlMask) {
-        flags |= CGEventFlags::CGEventFlagControl;
+        flags |= CGEventFlags::CGEventFlagControl
+            | CGEventFlags::from_bits_retain(side(XMods::ControlMask, NX_DEVICELCTLKEYMASK));
     }
-    if depressed.contains(XMods::Mod1Mask) || depressed.contains(XMods::Mod5Mask) {
+    if depressed.contains(XMods::Mod1Mask) {
+        flags |= CGEventFlags::CGEventFlagAlternate
+            | CGEventFlags::from_bits_retain(side(XMods::Mod1Mask, NX_DEVICELALTKEYMASK));
+    }
+    if depressed.contains(XMods::Mod5Mask) {
         // Mod5 is ISO_Level3_Shift (AltGr), right-Option on macOS
-        flags |= CGEventFlags::CGEventFlagAlternate;
+        flags |= CGEventFlags::CGEventFlagAlternate
+            | CGEventFlags::from_bits_retain(NX_DEVICERALTKEYMASK);
     }
     if depressed.contains(XMods::Mod4Mask) {
-        flags |= CGEventFlags::CGEventFlagCommand;
+        flags |= CGEventFlags::CGEventFlagCommand
+            | CGEventFlags::from_bits_retain(side(XMods::Mod4Mask, NX_DEVICELCMDKEYMASK));
     }
     flags
 }
