@@ -487,8 +487,25 @@ impl Emulation for MacOSEmulation {
                     locked,
                     group,
                 } => {
-                    // only update state; FlagsChanged events are posted in the Key handler
+                    // the Key handler posts FlagsChanged for modifier keys it sees, but
+                    // modifier state can also change without a Key event (modifier held
+                    // while entering / released after leaving) — post FlagsChanged for
+                    // the difference so apps tracking modifiers via FlagsChanged stay in
+                    // sync. Modifiers events that mirror a previous Key event are a no-op
+                    // here (state unchanged), so this cannot double modifiers.
+                    let old = self.modifier_state.get();
                     set_modifiers(&self.modifier_state, depressed, latched, locked, group);
+                    let new = self.modifier_state.get();
+                    for (mask, code) in [
+                        (XMods::ShiftMask, 56u16),  // kVK_Shift
+                        (XMods::ControlMask, 59),   // kVK_Control
+                        (XMods::Mod1Mask, 58),      // kVK_Option
+                        (XMods::Mod4Mask, 55),      // kVK_Command
+                    ] {
+                        if (old ^ new).contains(mask) {
+                            modifier_key_event(self.event_source.clone(), code, new);
+                        }
+                    }
                 }
             },
         }
