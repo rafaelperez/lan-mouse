@@ -576,23 +576,43 @@ fn special_key_flags(key: u16) -> CGEventFlags {
     }
 }
 
+// device-dependent modifier bits (IOKit NX_DEVICE*KEYMASK), not exposed by
+// core-graphics. Physical key events always carry them, and some apps (e.g.
+// wezterm) use them to distinguish left from right modifiers — an event with
+// only the device-independent bit is not recognized as a held modifier there.
+// XMods does not track which side was pressed, so emit the left-side bits
+// (right-Option for Mod5/AltGr, which is a distinct xkb modifier).
+const NX_DEVICELCTLKEYMASK: u64 = 0x00000001;
+const NX_DEVICELSHIFTKEYMASK: u64 = 0x00000002;
+const NX_DEVICELCMDKEYMASK: u64 = 0x00000008;
+const NX_DEVICELALTKEYMASK: u64 = 0x00000020;
+const NX_DEVICERALTKEYMASK: u64 = 0x00000040;
+
 fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
     let mut flags = CGEventFlags::empty();
     if depressed.contains(XMods::ShiftMask) {
-        flags |= CGEventFlags::CGEventFlagShift;
+        flags |= CGEventFlags::CGEventFlagShift
+            | CGEventFlags::from_bits_retain(NX_DEVICELSHIFTKEYMASK);
     }
     if depressed.contains(XMods::LockMask) {
         flags |= CGEventFlags::CGEventFlagAlphaShift;
     }
     if depressed.contains(XMods::ControlMask) {
-        flags |= CGEventFlags::CGEventFlagControl;
+        flags |= CGEventFlags::CGEventFlagControl
+            | CGEventFlags::from_bits_retain(NX_DEVICELCTLKEYMASK);
     }
-    if depressed.contains(XMods::Mod1Mask) || depressed.contains(XMods::Mod5Mask) {
+    if depressed.contains(XMods::Mod1Mask) {
+        flags |= CGEventFlags::CGEventFlagAlternate
+            | CGEventFlags::from_bits_retain(NX_DEVICELALTKEYMASK);
+    }
+    if depressed.contains(XMods::Mod5Mask) {
         // Mod5 is ISO_Level3_Shift (AltGr), right-Option on macOS
-        flags |= CGEventFlags::CGEventFlagAlternate;
+        flags |= CGEventFlags::CGEventFlagAlternate
+            | CGEventFlags::from_bits_retain(NX_DEVICERALTKEYMASK);
     }
     if depressed.contains(XMods::Mod4Mask) {
-        flags |= CGEventFlags::CGEventFlagCommand;
+        flags |= CGEventFlags::CGEventFlagCommand
+            | CGEventFlags::from_bits_retain(NX_DEVICELCMDKEYMASK);
     }
     flags
 }
