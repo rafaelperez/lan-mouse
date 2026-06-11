@@ -165,7 +165,11 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
             return;
         }
     };
-    event.set_flags(to_cgevent_flags(modifiers));
+    // build the flags explicitly: CGEvent pre-seeds new events with the
+    // source's accumulated state (do not merge with get_flags), and physical
+    // function-layer keys (arrows, F-keys, Home/End/...) always carry
+    // SecondaryFn/NumericPad, which strict shortcut matchers require
+    event.set_flags(special_key_flags(key) | to_cgevent_flags(modifiers));
     event.post(CGEventTapLocation::HID);
     log::trace!("key event: {key} {state}");
 }
@@ -539,6 +543,20 @@ fn set_modifiers(
 
     // we only care about the depressed modifiers for now
     active_modifiers.replace(depressed);
+}
+
+fn special_key_flags(key: u16) -> CGEventFlags {
+    match key {
+        // arrow keys
+        123..=126 => CGEventFlags::CGEventFlagSecondaryFn | CGEventFlags::CGEventFlagNumericPad,
+        // Help/Insert, Home, PageUp, ForwardDelete, End, PageDown
+        114 | 115 | 116 | 117 | 119 | 121 => CGEventFlags::CGEventFlagSecondaryFn,
+        // F1-F20
+        64 | 79 | 80 | 90 | 96..=101 | 103 | 105..=107 | 109 | 111 | 113 | 118 | 120 | 122 => {
+            CGEventFlags::CGEventFlagSecondaryFn
+        }
+        _ => CGEventFlags::empty(),
+    }
 }
 
 fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
