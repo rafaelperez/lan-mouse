@@ -487,7 +487,7 @@ impl Emulation for MacOSEmulation {
                     let code = match KeyMap::from_key_mapping(KeyMapping::Evdev(key as u16)) {
                         Ok(k) => k.mac as CGKeyCode,
                         Err(_) => {
-                            log::warn!("unable to map key event");
+                            log::warn!("unable to map key event (evdev key {key})");
                             return Ok(());
                         }
                     };
