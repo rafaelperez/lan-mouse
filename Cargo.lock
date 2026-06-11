@@ -1685,6 +1685,7 @@ dependencies = [
  "core-foundation",
  "core-foundation-sys",
  "core-graphics",
+ "foreign-types",
  "futures",
  "input-event",
  "keycode",

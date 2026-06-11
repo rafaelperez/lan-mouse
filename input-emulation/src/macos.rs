@@ -152,6 +152,18 @@ fn request_input_control_permission() -> bool {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
+    fn CGEventSetTimestamp(event: *mut core_graphics::sys::CGEvent, timestamp: u64);
+}
+
+extern "C" {
+    fn mach_absolute_time() -> u64;
+}
+
+/// synthetic events otherwise carry timestamp 0; apps that measure inter-event
+/// timing (modifier-hold panels, double-press detection) can ignore them
+fn stamp_event(event: &CGEvent) {
+    use foreign_types::ForeignType;
+    unsafe { CGEventSetTimestamp(event.as_ptr(), mach_absolute_time()) };
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -172,6 +184,7 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
     // function-layer keys (arrows, F-keys, Home/End/...) always carry
     // SecondaryFn/NumericPad, which strict shortcut matchers require
     event.set_flags(special_key_flags(key) | to_cgevent_flags(modifiers));
+    stamp_event(&event);
     event.post(CGEventTapLocation::HID);
     log::trace!("key event: {key} {state}");
 }
@@ -183,6 +196,7 @@ fn modifier_key_event(event_source: CGEventSource, key: u16, depressed: XMods) {
     };
     event.set_type(CGEventType::FlagsChanged);
     event.set_flags(to_cgevent_flags(depressed));
+    stamp_event(&event);
     event.post(CGEventTapLocation::HID);
     log::trace!("modifier key event: {key} {depressed:?}");
 }
