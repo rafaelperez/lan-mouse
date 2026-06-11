@@ -63,7 +63,9 @@ impl MacOSEmulation {
     pub(crate) fn new() -> Result<Self, MacOSEmulationCreationError> {
         request_macos_emulation_permissions()?;
 
-        let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+        // HIDSystemState is the source state physical events report; apps that
+        // inspect the event source state ignore session-state synthetic events
+        let event_source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
         Ok(Self {
             event_source,
