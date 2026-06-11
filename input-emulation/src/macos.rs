@@ -579,10 +579,13 @@ fn update_modifiers(
         let mut mods = modifiers.get();
         let mut dev = device_mods.get();
         match state {
+            // caps lock latches: flip on press, ignore release
+            1 if mask == XMods::LockMask => mods.toggle(mask),
             1 => {
                 mods.insert(mask);
                 dev |= device_bit;
             }
+            _ if mask == XMods::LockMask => {}
             _ => {
                 dev &= !device_bit;
                 // keep the modifier active while the other side is still held
@@ -608,11 +611,11 @@ fn set_modifiers(
 ) {
     let depressed = XMods::from_bits(depressed).unwrap_or_default();
     let _latched = XMods::from_bits(latched).unwrap_or_default();
-    let _locked = XMods::from_bits(locked).unwrap_or_default();
+    let locked = XMods::from_bits(locked).unwrap_or_default();
     let _group = XMods::from_bits(group).unwrap_or_default();
 
-    // we only care about the depressed modifiers for now
-    active_modifiers.replace(depressed);
+    // held modifiers come from `depressed`; caps lock latches via `locked`
+    active_modifiers.replace(depressed | (locked & XMods::LockMask));
 }
 
 fn special_key_flags(key: u16) -> CGEventFlags {
